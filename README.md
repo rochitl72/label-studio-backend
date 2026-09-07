@@ -190,6 +190,46 @@ in through the web app — the deployment team's job is just to hand out the
 username and a one-time password, not to manage what the user's real
 password ends up being.
 
+### Worked example
+
+```bash
+cd /home/rbg/rbg-annotation-studio-backend
+source .venv/bin/activate
+
+# create a second admin account
+python3 manage.py create-user --username priya --role admin
+Password for 'priya': ********
+Confirm password: ********
+Created user 'priya' (id=2, role=admin). They will be prompted to change their password on first login.
+
+# create a regular annotator account
+python3 manage.py create-user --username arjun --role user --email arjun@org.com --full-name "Arjun R"
+Password for 'arjun': ********
+Confirm password: ********
+Created user 'arjun' (id=3, role=user). They will be prompted to change their password on first login.
+
+# see everyone
+python3 manage.py list-users
+ID   USERNAME  ROLE   STATUS   EMAIL           LAST LOGIN
+1    admin     admin  active                   2026-09-07 10:02
+2    priya     admin  active                   never
+3    arjun     user   active   arjun@org.com   never
+
+# forgot password? reset it
+python3 manage.py reset-password --username arjun
+New password for 'arjun': ********
+Confirm password: ********
+Password reset for 'arjun'. They will be prompted to change it again on next login.
+
+# someone leaves — deactivate, don't delete (keeps their annotation history intact)
+python3 manage.py deactivate-user --username arjun
+Deactivated 'arjun'.
+
+# refuses to lock everyone out — this is rejected, not applied
+python3 manage.py deactivate-user --username admin
+Refusing: this is the last active admin — promote another admin first, otherwise nobody could administer the system.
+```
+
 ---
 
 ## On-disk storage layout
