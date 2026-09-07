@@ -152,6 +152,46 @@ empty one. Account security rests on choosing sensible values above.
 
 ---
 
+## Account management (server-side, no web UI needed)
+
+Usernames and passwords, for both regular users and admins, can be fully
+managed from the server via `manage.py` — no need to sign into the app to
+create the first accounts or reset someone's password. It connects to the
+same database as the app (via `db_config.py` if filled in, else `.env`) and
+reuses the app's own password hashing, so passwords are **never** stored in
+plaintext — you type a plain password once at the prompt and it's hashed
+before it touches the database.
+
+```bash
+cd /home/rbg/rbg-annotation-studio-backend
+source .venv/bin/activate
+
+# create an account (prompts for password, hidden input)
+python3 manage.py create-user --username alice --role user
+python3 manage.py create-user --username bob --role admin
+
+# reset a forgotten password
+python3 manage.py reset-password --username alice
+
+# list every account and its status
+python3 manage.py list-users
+
+# deactivate / re-activate (refuses if it would leave zero active admins)
+python3 manage.py deactivate-user --username alice
+python3 manage.py activate-user --username alice
+
+# promote or demote (also refuses to demote the last active admin)
+python3 manage.py set-role --username alice --role admin
+```
+
+Every account created or reset this way has `must_change_password` set, so
+the person is prompted to pick their own password the first time they log
+in through the web app — the deployment team's job is just to hand out the
+username and a one-time password, not to manage what the user's real
+password ends up being.
+
+---
+
 ## On-disk storage layout
 
 Uploaded images are organised by role, then by user, under `STORAGE_DIR`:
