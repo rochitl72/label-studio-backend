@@ -1,0 +1,51 @@
+# .github/workflows/deploy.yml
+name: Deploy Backend Services
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Copy files to server directory
+        shell: bash
+        run: |
+          set -e
+
+          # CHANGE ME if the backend should live somewhere else on the server.
+          TARGET="/home/rbg/rbg-annotation-studio-backend/"
+          echo "Ensuring target directory exists..."
+          sudo mkdir -p "$TARGET"
+
+          echo "Copying repository contents to target directory..."
+          # db_config.py and config.py are anchored with a leading "/" so
+          # ONLY the repo-root copies are excluded. An unanchored pattern
+          # (e.g. --exclude 'config.py') would also match
+          # app/core/config.py, which is real application source code, not a
+          # secrets file, and must be deployed on every push.
+          sudo rsync -av \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '/db_config.py' \
+            --exclude '/config.py' \
+            ./ "$TARGET"
+
+          echo "Fixing ownership..."
+          sudo chown -R rbg:rbg "$TARGET"
+
+          echo "Reloading PM2..."
+          # Scoped to this app only, so a push here never bounces unrelated
+          # services on a shared server. Use "pm2 reload all" instead if your
+          # convention prefers reloading everything on every deploy.
+          pm2 reload rbg-backend
+
+          echo "Checking PM2 status..."
+          pm2 status
+
+          echo "Deployment copy and pm2 restart completed successfully."

@@ -1,0 +1,38 @@
+# This repo is deployed WITHOUT Docker (pm2 + a native venv on the physical
+# server) -- these files are leftovers from the combined dev repo's Docker
+# Compose setup and are deliberately not tracked here.
+Dockerfile
+.dockerignore
+entrypoint.sh
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Secrets / local config -- .env is for local dev only; the deployed server
+# reads db_config.py and config.py instead (see those files, both of which
+# ARE committed, with placeholder values).
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Runtime data (never commit)
+storage/
+checkpoints/
+.pids/
+logs/
+*.db
+*.db-journal

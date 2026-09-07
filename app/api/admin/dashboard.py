@@ -1,0 +1,686 @@
+"""Admin dashboards. Read-only metrics; admin role required throughout.
+
+Endpoints, grouped by what they answer:
+  progress & velocity   /overview, /velocity, /contributors
+  quality & agreement   /quality, /agreement
+  workload & review     /workload, /review-queue
+  activity feed         (see api/admin/activity.py)
+
+Note: /overview and /review-queue are the two the UI currently renders.
+/velocity, /quality and /workload are implemented and wired into
+`frontend/src/lib/api/client.js`, but no component displays them yet.
+"""
+from collections import defaultdict
+from datetime import date, datetime, time, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.security import current_user, require_admin
+from app.db.database import get_db
+from app.models import (
+    Action, ActivityLog, Annotation, Image, Project, Role, User, utcnow,
+)
+from app.services import activity
+from app.services.metrics import iou_matrix, pairwise_agreement
+
+router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+
+def _images_of_user(user_id: int):
+    """Subquery: image ids in projects assigned to this user.
+
+    Under the single-user-per-project model there is no per-image assignment;
+    an image "belongs" to a user through its project's assigned_user_id. The
+    dashboards use this in place of the old `Image.assigned_to == user`.
+    """
+    return select(Image.id).join(Project, Image.project_id == Project.id).where(
+        Project.assigned_user_id == user_id
+    )
+
+STATUSES = (
+    "unannotated", "in_progress", "annotated",
+    "needs_review", "approved", "rejected",
+)
+
+
+def _aware(dt):
+    from datetime import timezone
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# ─── C1 · Progress & velocity ────────────────────────────────────────
+@router.get("/overview")
+async def overview(
+    project_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Headline numbers: completion split, totals, and projected finish."""
+    q = select(Image.status, func.count()).group_by(Image.status)
+    if project_id:
+        q = q.where(Image.project_id == project_id)
+    by_status = {s: 0 for s in STATUSES}
+    for status, n in (await db.execute(q)).all():
+        by_status[status] = n
+    total = sum(by_status.values())
+
+    done = by_status["approved"]
+    in_flight = by_status["annotated"] + by_status["needs_review"]
+    remaining = total - done
+
+    aq = select(func.count()).select_from(Annotation)
+    uq = select(func.count()).select_from(User).where(User.status == "active")
+    if project_id:
+        aq = aq.join(Image, Annotation.image_id == Image.id).where(
+            Image.project_id == project_id
+        )
+        # "Active users" must follow the project filter too. It previously
+        # counted every active account in the system even when a single
+        # project was selected, so the card never changed with the dropdown.
+        # Under one-user-per-project this is the assignee (0 or 1) plus the
+        # admins, who can reach every project.
+        uq = uq.where(
+            (User.role == Role.ADMIN)
+            | (
+                User.id
+                == select(Project.assigned_user_id)
+                .where(Project.id == project_id)
+                .scalar_subquery()
+            )
+        )
+
+    # Throughput over the last 7 days → naive ETA.
+    #
+    # Counted as DISTINCT images, not raw approve events. The audit log is
+    # append-only, so approving an image, un-approving it and approving it
+    # again writes three rows; counting those made the card read "2 approved"
+    # while the status breakdown right below it showed 1, which looks broken.
+    # Distinct images keeps this consistent with by_status and is still a fair
+    # measure of review throughput.
+    week_ago = utcnow() - timedelta(days=7)
+    recent_q = (
+        select(func.count(func.distinct(ActivityLog.image_id)))
+        .select_from(ActivityLog)
+        .where(
+            ActivityLog.action == Action.REVIEW_APPROVE,
+            ActivityLog.created_at >= week_ago,
+            ActivityLog.image_id.isnot(None),
+        )
+    )
+    if project_id:
+        recent_q = recent_q.where(ActivityLog.project_id == project_id)
+    approved_last_week = await db.scalar(recent_q) or 0
+    per_day = approved_last_week / 7 if approved_last_week else 0
+    eta_days = round(remaining / per_day, 1) if per_day > 0 else None
+
+    return {
+        "total_images": total,
+        "by_status": by_status,
+        "completion_pct": round(done / total * 100, 1) if total else 0.0,
+        "in_flight": in_flight,
+        "remaining": remaining,
+        "total_annotations": await db.scalar(aq) or 0,
+        "active_users": await db.scalar(uq) or 0,
+        "approved_last_7_days": approved_last_week,
+        "throughput_per_day": round(per_day, 2),
+        "projected_days_remaining": eta_days,
+    }
+
+
+# Statuses that mean "the annotator has finished this image". Progress is
+# measured in IMAGES MARKED DONE, not in annotation count: the number of shapes
+# on an image varies wildly by content, so "127 annotations" says nothing about
+# how far through a dataset you are. Images are the unit of work, and x/y images
+# done is a figure you can act on.
+DONE_STATUSES = ("annotated", "needs_review", "approved")
+
+
+@router.get("/progress")
+async def progress(
+    project_id: int | None = None,
+    days: int = Query(30, ge=1, le=400),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Everything the admin dashboard renders, in one call.
+
+    Returns headline x/y progress, the status split, a per-day timeline over the
+    requested window, and a per-project breakdown — all filterable to a single
+    project and to a time range (today / 7 / 30 / 60 days).
+    """
+    # ── Headline counts ──────────────────────────────────────────────
+    q = select(Image.status, func.count()).group_by(Image.status)
+    if project_id:
+        q = q.where(Image.project_id == project_id)
+    by_status = {s: 0 for s in STATUSES}
+    for status_, n in (await db.execute(q)).all():
+        if status_ in by_status:
+            by_status[status_] = n
+    total = sum(by_status.values())
+
+    done = sum(by_status[s] for s in DONE_STATUSES)
+    approved = by_status["approved"]
+    remaining = total - done
+
+    # ── Per-day timeline, from the append-only audit log ─────────────
+    # The log is the only place image history lives; Image.status holds just the
+    # CURRENT value, so a trend has to come from here.
+    since_date = utcnow().date() - timedelta(days=days - 1)
+    since = datetime.combine(since_date, time.min, tzinfo=timezone.utc)
+
+    lq = select(ActivityLog).where(
+        ActivityLog.created_at >= since,
+        ActivityLog.action.in_([Action.IMAGE_STATUS, Action.REVIEW_APPROVE]),
+    )
+    if project_id:
+        lq = lq.where(ActivityLog.project_id == project_id)
+    log_rows = (await db.execute(lq)).scalars().all()
+
+    buckets: dict[str, dict] = {}
+    for i in range(days):
+        d = (since_date + timedelta(days=i)).isoformat()
+        buckets[d] = {"date": d, "marked_done": 0, "approved": 0}
+
+    # Count each image at most once per day per transition, so re-marking the
+    # same image twice in a day does not inflate the trend.
+    seen_done: set[tuple[str, int]] = set()
+    seen_appr: set[tuple[str, int]] = set()
+    for r in log_rows:
+        created = _aware(r.created_at)
+        if not created:
+            continue
+        key = created.date().isoformat()
+        if key not in buckets or r.image_id is None:
+            continue
+        details = r.details or {}
+        to = details.get("to")
+        if r.action == Action.REVIEW_APPROVE or to == "approved":
+            if (key, r.image_id) not in seen_appr:
+                seen_appr.add((key, r.image_id))
+                buckets[key]["approved"] += 1
+        if to in DONE_STATUSES:
+            if (key, r.image_id) not in seen_done:
+                seen_done.add((key, r.image_id))
+                buckets[key]["marked_done"] += 1
+
+    series = list(buckets.values())
+    done_in_range = sum(b["marked_done"] for b in series)
+    approved_in_range = sum(b["approved"] for b in series)
+    per_day = done_in_range / days if done_in_range else 0.0
+    eta_days = round(remaining / per_day, 1) if per_day > 0 else None
+
+    # ── Per-project breakdown ────────────────────────────────────────
+    pq = select(Project.id, Project.name, Project.assigned_user_id).order_by(Project.id)
+    if project_id:
+        pq = pq.where(Project.id == project_id)
+    projects_out = []
+    for pid, pname, assignee_id in (await db.execute(pq)).all():
+        sq = (
+            select(Image.status, func.count())
+            .where(Image.project_id == pid)
+            .group_by(Image.status)
+        )
+        counts = {s: 0 for s in STATUSES}
+        for status_, n in (await db.execute(sq)).all():
+            if status_ in counts:
+                counts[status_] = n
+        p_total = sum(counts.values())
+        p_done = sum(counts[s] for s in DONE_STATUSES)
+        assignee = None
+        if assignee_id:
+            assignee = await db.scalar(
+                select(User.username).where(User.id == assignee_id)
+            )
+        projects_out.append({
+            "id": pid,
+            "name": pname,
+            "assignee": assignee,
+            "total": p_total,
+            "done": p_done,
+            "approved": counts["approved"],
+            "remaining": p_total - p_done,
+            "completion_pct": round(p_done / p_total * 100, 1) if p_total else 0.0,
+            "by_status": counts,
+        })
+
+    # ── Who finished how many images (replaces the annotation tally) ──
+    people = (
+        await db.execute(
+            select(User.id, User.username, User.full_name, User.role)
+            .where(User.status == "active")
+            .order_by(User.username)
+        )
+    ).all()
+    contributors_out = []
+    for uid, uname, ufull, urole in people:
+        base = select(func.count()).select_from(Image).where(
+            Image.id.in_(_images_of_user(uid))
+        )
+        if project_id:
+            base = base.where(Image.project_id == project_id)
+        c_assigned = await db.scalar(base) or 0
+        c_done = await db.scalar(base.where(Image.status.in_(DONE_STATUSES))) or 0
+        c_approved = await db.scalar(base.where(Image.status == "approved")) or 0
+        if c_assigned == 0 and urole != Role.ADMIN:
+            continue
+        contributors_out.append({
+            "user_id": uid,
+            "username": uname,
+            "full_name": ufull,
+            "role": urole,
+            "images_assigned": c_assigned,
+            "images_done": c_done,
+            "images_approved": c_approved,
+            "completion_pct": (
+                round(c_done / c_assigned * 100, 1) if c_assigned else 0.0
+            ),
+        })
+    contributors_out.sort(key=lambda r: r["images_done"], reverse=True)
+
+    return {
+        "range_days": days,
+        "project_id": project_id,
+        "total_images": total,
+        "done": done,
+        "remaining": remaining,
+        "approved": approved,
+        "completion_pct": round(done / total * 100, 1) if total else 0.0,
+        "approved_pct": round(approved / total * 100, 1) if total else 0.0,
+        "by_status": by_status,
+        "series": series,
+        "done_in_range": done_in_range,
+        "approved_in_range": approved_in_range,
+        "throughput_per_day": round(per_day, 2),
+        "projected_days_remaining": eta_days,
+        "projects": projects_out,
+        "contributors": contributors_out,
+    }
+
+
+@router.get("/velocity")
+async def velocity(
+    project_id: int | None = None,
+    days: int = Query(14, ge=1, le=180),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Daily completed-vs-approved counts, for the trend chart."""
+    since = utcnow() - timedelta(days=days)
+    q = select(ActivityLog).where(
+        ActivityLog.created_at >= since,
+        ActivityLog.action.in_(
+            [Action.IMAGE_STATUS, Action.REVIEW_APPROVE, Action.ANNOTATION_CREATE]
+        ),
+    )
+    if project_id:
+        q = q.where(ActivityLog.project_id == project_id)
+    rows = (await db.execute(q)).scalars().all()
+
+    buckets: dict[str, dict] = {}
+    for i in range(days + 1):
+        d = (utcnow().date() - timedelta(days=days - i)).isoformat()
+        buckets[d] = {"date": d, "annotations": 0, "approved": 0, "completed": 0}
+
+    for r in rows:
+        created = _aware(r.created_at)
+        if not created:
+            continue
+        key = created.date().isoformat()
+        if key not in buckets:
+            continue
+        if r.action == Action.ANNOTATION_CREATE:
+            buckets[key]["annotations"] += 1
+        elif r.action == Action.REVIEW_APPROVE:
+            buckets[key]["approved"] += 1
+        elif r.action == Action.IMAGE_STATUS:
+            if (r.details or {}).get("to") == "annotated":
+                buckets[key]["completed"] += 1
+
+    return {"days": days, "series": list(buckets.values())}
+
+
+@router.get("/contributors")
+async def contributors(
+    project_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Per-user contribution table."""
+    users = (
+        await db.execute(select(User).where(User.status == "active").order_by(User.username))
+    ).scalars().all()
+
+    today = utcnow().date()
+    week_ago = utcnow() - timedelta(days=7)
+
+    out = []
+    for u in users:
+        aq = select(func.count()).select_from(Annotation).where(
+            Annotation.created_by == u.id
+        )
+        if project_id:
+            aq = aq.join(Image, Annotation.image_id == Image.id).where(
+                Image.project_id == project_id
+            )
+        total_ann = await db.scalar(aq) or 0
+
+        # Today / this-week counts must come from the SAME source as the total,
+        # otherwise the row contradicts itself. They used to be read from the
+        # append-only activity log while the total counted live rows, so an
+        # annotation that was created and then deleted showed up as
+        # "total 0, today 1" — impossible on its face.
+        #
+        # Counting live annotations by created_at guarantees
+        # total >= this_week >= today.
+        day_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
+
+        def _since(ts):
+            sq = select(func.count()).select_from(Annotation).where(
+                Annotation.created_by == u.id, Annotation.created_at >= ts
+            )
+            if project_id:
+                sq = sq.join(Image, Annotation.image_id == Image.id).where(
+                    Image.project_id == project_id
+                )
+            return sq
+
+        today_count = await db.scalar(_since(day_start)) or 0
+        week_count = await db.scalar(_since(week_ago)) or 0
+
+        assigned = await db.scalar(
+            select(func.count()).select_from(Image).where(
+                Image.id.in_(_images_of_user(u.id))
+            )
+        ) or 0
+        approved = await db.scalar(
+            select(func.count()).select_from(Image).where(
+                Image.id.in_(_images_of_user(u.id)), Image.status == "approved"
+            )
+        ) or 0
+
+        out.append({
+            "user_id": u.id,
+            "username": u.username,
+            "full_name": u.full_name,
+            "role": u.role,
+            "annotations_total": total_ann,
+            "annotations_today": today_count,
+            "annotations_this_week": week_count,
+            "images_assigned": assigned,
+            "images_approved": approved,
+            "last_login_at": u.last_login_at,
+        })
+    out.sort(key=lambda r: r["annotations_total"], reverse=True)
+    return {"contributors": out}
+
+
+# ─── C2 · Quality & agreement ────────────────────────────────────────
+@router.get("/quality")
+async def quality(
+    project_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Rejection rate and labelling density per annotator.
+
+    Rejection rate is the strongest quality signal available: of the images a
+    person worked on that a reviewer has ruled on, how many were sent back.
+    """
+    users = (
+        await db.execute(select(User).where(User.status == "active"))
+    ).scalars().all()
+
+    # Project-wide average annotations per image, as a comparison baseline.
+    img_q = select(func.count()).select_from(Image)
+    ann_q = select(func.count()).select_from(Annotation)
+    if project_id:
+        img_q = img_q.where(Image.project_id == project_id)
+        ann_q = ann_q.join(Image, Annotation.image_id == Image.id).where(
+            Image.project_id == project_id
+        )
+    total_images = await db.scalar(img_q) or 0
+    total_anns = await db.scalar(ann_q) or 0
+    project_avg = round(total_anns / total_images, 2) if total_images else 0.0
+
+    rows = []
+    for u in users:
+        base = select(func.count()).select_from(Image).where(
+            Image.id.in_(_images_of_user(u.id))
+        )
+        if project_id:
+            base = base.where(Image.project_id == project_id)
+        approved = await db.scalar(base.where(Image.status == "approved")) or 0
+        rejected = await db.scalar(base.where(Image.status == "rejected")) or 0
+        judged = approved + rejected
+
+        # Images this user actually drew on, and how densely.
+        touched_q = (
+            select(func.count(func.distinct(Annotation.image_id)))
+            .where(Annotation.created_by == u.id)
+        )
+        ann_count_q = select(func.count()).select_from(Annotation).where(
+            Annotation.created_by == u.id
+        )
+        if project_id:
+            touched_q = touched_q.join(Image, Annotation.image_id == Image.id).where(
+                Image.project_id == project_id
+            )
+            ann_count_q = ann_count_q.join(
+                Image, Annotation.image_id == Image.id
+            ).where(Image.project_id == project_id)
+        touched = await db.scalar(touched_q) or 0
+        made = await db.scalar(ann_count_q) or 0
+
+        rows.append({
+            "user_id": u.id,
+            "username": u.username,
+            "images_judged": judged,
+            "approved": approved,
+            "rejected": rejected,
+            "rejection_rate": round(rejected / judged * 100, 1) if judged else None,
+            "images_touched": touched,
+            "annotations_made": made,
+            "avg_annotations_per_image": round(made / touched, 2) if touched else 0.0,
+            "vs_project_avg": (
+                round(made / touched - project_avg, 2) if touched else None
+            ),
+        })
+    rows.sort(key=lambda r: (r["rejection_rate"] is None, -(r["rejection_rate"] or 0)))
+    return {"project_avg_annotations_per_image": project_avg, "annotators": rows}
+
+
+@router.get("/agreement")
+async def agreement(
+    project_id: int | None = None,
+    iou_threshold: float = Query(0.5, ge=0.1, le=0.95),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Inter-annotator agreement.
+
+    Finds images that more than one person annotated and compares their work
+    geometrically: for each pair, what fraction of one's boxes have a matching
+    box from the other above the IoU threshold. This is the metric that makes
+    multiple annotators on one image worth having — it quantifies whether two
+    people label the same thing the same way.
+    """
+    q = (
+        select(Annotation.image_id, Annotation.created_by)
+        .where(Annotation.created_by.is_not(None))
+        .distinct()
+    )
+    if project_id:
+        q = q.join(Image, Annotation.image_id == Image.id).where(
+            Image.project_id == project_id
+        )
+    pairs = (await db.execute(q)).all()
+
+    by_image: dict[int, set[int]] = defaultdict(set)
+    for image_id, uid in pairs:
+        by_image[image_id].add(uid)
+    shared = {i: us for i, us in by_image.items() if len(us) > 1}
+
+    if not shared:
+        return {
+            "images_compared": 0,
+            "note": "No image has been annotated by more than one person yet.",
+            "pairs": [],
+            "per_image": [],
+        }
+
+    usernames = {
+        u.id: u.username
+        for u in (await db.execute(select(User))).scalars().all()
+    }
+
+    anns = (
+        await db.execute(
+            select(Annotation).where(Annotation.image_id.in_(list(shared.keys())))
+        )
+    ).scalars().all()
+
+    grouped: dict[tuple[int, int], list] = defaultdict(list)
+    for a in anns:
+        if a.created_by is not None:
+            grouped[(a.image_id, a.created_by)].append(a)
+
+    pair_scores: dict[tuple[int, int], list[float]] = defaultdict(list)
+    per_image = []
+    for image_id, users_on_image in shared.items():
+        ordered = sorted(users_on_image)
+        image_scores = []
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                a_list = grouped[(image_id, ordered[i])]
+                b_list = grouped[(image_id, ordered[j])]
+                score = pairwise_agreement(a_list, b_list, iou_threshold)
+                pair_scores[(ordered[i], ordered[j])].append(score)
+                image_scores.append(score)
+        per_image.append({
+            "image_id": image_id,
+            "annotators": [usernames.get(u, str(u)) for u in ordered],
+            "agreement": round(sum(image_scores) / len(image_scores), 3)
+            if image_scores else 0.0,
+        })
+
+    pairs_out = [
+        {
+            "user_a": usernames.get(a, str(a)),
+            "user_b": usernames.get(b, str(b)),
+            "images_compared": len(scores),
+            "mean_agreement": round(sum(scores) / len(scores), 3),
+        }
+        for (a, b), scores in pair_scores.items()
+    ]
+    pairs_out.sort(key=lambda r: r["mean_agreement"])
+
+    overall = [s for scores in pair_scores.values() for s in scores]
+    return {
+        "iou_threshold": iou_threshold,
+        "images_compared": len(shared),
+        "mean_agreement": round(sum(overall) / len(overall), 3) if overall else 0.0,
+        "pairs": pairs_out,
+        "per_image": sorted(per_image, key=lambda r: r["agreement"])[:50],
+    }
+
+
+# ─── C4 · Workload ───────────────────────────────────────────────────
+# Per-image assignment and image locks were removed with the multi-user model.
+# "Workload" is now measured over the projects assigned to each user.
+@router.get("/workload")
+async def workload(
+    project_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Per-annotator: images in their assigned projects, pending vs completed,
+    plus the count of images in projects that have no assigned user yet."""
+    users = (
+        await db.execute(
+            select(User).where(User.status == "active").order_by(User.username)
+        )
+    ).scalars().all()
+
+    rows = []
+    for u in users:
+        base = select(func.count()).select_from(Image).where(
+            Image.id.in_(_images_of_user(u.id))
+        )
+        if project_id:
+            base = base.where(Image.project_id == project_id)
+        assigned = await db.scalar(base) or 0
+        pending = await db.scalar(
+            base.where(Image.status.in_(["unannotated", "in_progress"]))
+        ) or 0
+        done = await db.scalar(
+            base.where(Image.status.in_(["annotated", "needs_review", "approved"]))
+        ) or 0
+        rows.append({
+            "user_id": u.id,
+            "username": u.username,
+            "role": u.role,
+            "assigned": assigned,
+            "pending": pending,
+            "completed": done,
+            "completion_pct": round(done / assigned * 100, 1) if assigned else 0.0,
+        })
+
+    # Backlog: images in projects that have not been assigned to anyone.
+    unassigned_q = select(func.count()).select_from(Image).where(
+        Image.project_id.in_(
+            select(Project.id).where(Project.assigned_user_id.is_(None))
+        )
+    )
+    if project_id:
+        unassigned_q = unassigned_q.where(Image.project_id == project_id)
+
+    return {"workload": rows, "unassigned": await db.scalar(unassigned_q) or 0}
+
+
+@router.get("/review-queue")
+async def review_queue(
+    project_id: int | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Images waiting on a reviewer, oldest first."""
+    q = select(Image).where(Image.status.in_(["annotated", "needs_review"]))
+    if project_id:
+        q = q.where(Image.project_id == project_id)
+    q = q.order_by(Image.created_at).limit(limit)
+    images = (await db.execute(q)).scalars().all()
+
+    # Map each project to its assigned user's name, so the queue can show who
+    # owns each image (its project's assignee) without a per-image field.
+    proj_assignee = {
+        pid: uid
+        for pid, uid in (
+            await db.execute(select(Project.id, Project.assigned_user_id))
+        ).all()
+    }
+    usernames = {
+        u.id: u.username for u in (await db.execute(select(User))).scalars().all()
+    }
+    out = []
+    for img in images:
+        n = await db.scalar(
+            select(func.count()).select_from(Annotation).where(
+                Annotation.image_id == img.id
+            )
+        )
+        out.append({
+            "image_id": img.id,
+            "project_id": img.project_id,
+            "filename": img.filename,
+            "status": img.status,
+            "assigned_to": usernames.get(proj_assignee.get(img.project_id)),
+            "annotation_count": n or 0,
+        })
+    return {"queue": out, "count": len(out)}
