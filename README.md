@@ -125,8 +125,9 @@ or run new migrations automatically. After a push that changes either:
 ```bash
 .venv/bin/pip install -r requirements.txt   # if requirements.txt changed
 .venv/bin/alembic upgrade head               # if a new migration was added
-pm2 reload rbg-backend                       # deploy.yml already does this, but
-                                              # re-run manually if you skipped it
+pm2 reload rbg-backend                       # autoDeploy.yml already runs
+                                              # `pm2 reload all`; re-run this
+                                              # manually if you skipped it
 ```
 
 ---
@@ -163,7 +164,7 @@ plaintext — you type a plain password once at the prompt and it's hashed
 before it touches the database.
 
 ```bash
-cd /home/rbg/rbg-annotation-studio-backend
+cd /home/rbg/Backend-services
 source .venv/bin/activate
 
 # create an account (prompts for password, hidden input)
@@ -193,7 +194,7 @@ password ends up being.
 ### Worked example
 
 ```bash
-cd /home/rbg/rbg-annotation-studio-backend
+cd /home/rbg/Backend-services
 source .venv/bin/activate
 
 # create a second admin account
