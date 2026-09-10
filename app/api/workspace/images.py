@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from PIL import Image as PILImage
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.security import current_user, current_user_or_cookie, require_admin
@@ -198,11 +199,14 @@ async def upload_images(
         # 3. Confirm the bytes really are a decodable image, not just something
         #    wearing an image extension. verify() consumes the file object, so
         #    reopen afterwards to read the dimensions.
-        try:
-            with PILImage.open(target) as probe:
+        def _validate_and_size(path):
+            with PILImage.open(path) as probe:
                 probe.verify()
-            with PILImage.open(target) as img:
-                w, h = img.size
+            with PILImage.open(path) as img:
+                return img.size
+
+        try:
+            w, h = await run_in_threadpool(_validate_and_size, target)
         except Exception:
             target.unlink(missing_ok=True)
             log.warning("Rejected upload %r: not a valid image", file.filename)
